@@ -7,13 +7,18 @@
 # 2) Voltar filtros completos: Unidades + (botões selecionar/limpar), Mês, Período dentro do mês, Vistoriadores + (botões)
 # 3) Tendência/Projeção no RESUMO calculadas em cima do TOTAL BRUTO (VISTORIAS), como solicitado
 # 4) HISTÓRICO DE META: comparar META x GERAL (VISTORIAS) e mostrar Meta antes do Realizado (Geral)
+# 5) CORREÇÃO: DIAS_PASSADOS no RESUMO passa a ser por CALENDÁRIO (dias úteis decorridos até a data de referência),
+#    e não "dias com registro" do vistoriador. (Faltas contam contra, como deve ser.)
+#    Também alinhado FALTANTE_MES ao BRUTO (VISTORIAS), para coerência com tendência/projeção no bruto.
 # ============================================================
 
 import os
 import re
 import json
 import unicodedata
-from datetime import datetime, date
+import time
+import random
+from datetime import datetime, date, timedelta
 from typing import Optional, Tuple, Dict, List
 
 import streamlit as st
@@ -22,6 +27,7 @@ import numpy as np
 import altair as alt
 
 import gspread
+from gspread.exceptions import APIError
 from oauth2client.service_account import ServiceAccountCredentials
 
 
@@ -91,8 +97,12 @@ client = make_client()
 # ------------------ SECRETS: IDs ------------------
 PROD_INDEX_ID = st.secrets.get("log_index_sheet_id", "").strip()
 if not PROD_INDEX_ID:
-    st.error("Faltou `prod_index_sheet_id` no secrets.toml")
+    st.error("Faltou `log_index_sheet_id` no secrets.toml")
     st.stop()
+
+# ID do índice usado no painel dos analistas.
+# Ele será usado apenas para trazer o TEMPO MÉDIO DA ETAPA VISTORIADOR.
+ANALISTAS_INDEX_ID = st.secrets.get("analistas_index_sheet_id", "").strip()
 
 
 # ------------------ HELPERS ------------------
@@ -151,6 +161,92 @@ def _find_col(cols, *names) -> Optional[str]:
             return norm[key]
     return None
 
+def _dedup_headers(headers: List[str]) -> List[str]:
+    """Garante cabeçalhos não-vazios e únicos para leitura robusta do Google Sheets."""
+    out = []
+    seen = {}
+    for i, h in enumerate(headers):
+        h2 = str(h).strip()
+        if not h2:
+            h2 = f"COL_{i+1}"
+        base = h2
+        k = seen.get(base, 0) + 1
+        seen[base] = k
+        if k > 1:
+            h2 = f"{base}_{k}"
+        out.append(h2)
+    return out
+
+def _ws_get_all_values_with_retry(ws, tries: int = 5, base_sleep: float = 0.8):
+    last_err = None
+    for n in range(tries):
+        try:
+            return ws.get_all_values()
+        except APIError as e:
+            last_err = e
+            time.sleep(base_sleep * (2 ** n) + random.random() * 0.35)
+        except Exception as e:
+            last_err = e
+            time.sleep(base_sleep * (2 ** n) + random.random() * 0.35)
+    raise last_err
+
+def ws_to_df(ws) -> pd.DataFrame:
+    """Converte worksheet em DataFrame usando get_all_values, mais resiliente que get_all_records."""
+    values = _ws_get_all_values_with_retry(ws)
+    if not values:
+        return pd.DataFrame()
+    headers = _dedup_headers(values[0])
+    rows = values[1:] if len(values) > 1 else []
+    df = pd.DataFrame(rows, columns=headers)
+    df = df.replace("", np.nan).dropna(how="all").fillna("")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+def parse_time_seconds(x) -> int:
+    """Converte HH:MM:SS, MM:SS ou valores parecidos em segundos."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return 0
+    s = str(x).strip()
+    if not s:
+        return 0
+
+    # Caso venha como número do Excel representando fração de dia
+    try:
+        if re.fullmatch(r"\d+(?:[.,]\d+)?", s) and ":" not in s:
+            val = float(s.replace(",", "."))
+            if 0 < val < 1:
+                return int(round(val * 24 * 3600))
+    except Exception:
+        pass
+
+    parts = s.split(":")
+    try:
+        parts = [int(float(p)) for p in parts]
+    except Exception:
+        return 0
+    if len(parts) == 3:
+        h, m, s2 = parts
+    elif len(parts) == 2:
+        h, m, s2 = 0, parts[0], parts[1]
+    else:
+        return 0
+    return h * 3600 + m * 60 + s2
+
+def format_seconds_mmss(sec: float) -> str:
+    """Formata segundos em MM:SS ou HH:MM:SS quando passar de 1h."""
+    try:
+        if sec is None or pd.isna(sec) or float(sec) <= 0:
+            return "—"
+        sec = int(round(float(sec)))
+    except Exception:
+        return "—"
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
 def _fmt_int(x) -> str:
     try:
         return f"{int(x):,}".replace(",", ".")
@@ -165,6 +261,19 @@ def _is_workday(d):
 
 def _nt(x):
     return x
+
+def _workdays_elapsed_in_month(ref: Optional[date]) -> int:
+    """Dias úteis decorridos no mês até ref (inclusive), contando 2ª–6ª."""
+    if not isinstance(ref, date):
+        return 0
+    start = date(ref.year, ref.month, 1)
+    cur = start
+    n = 0
+    while cur <= ref:
+        if cur.weekday() < 5:
+            n += 1
+        cur += timedelta(days=1)
+    return int(n)
 
 
 # ------------------ LEITURA DO ÍNDICE ------------------
@@ -272,6 +381,93 @@ def read_prod_month(month_sheet_id: str, ym: Optional[str] = None) -> Tuple[pd.D
     return df, metas, title
 
 
+# ------------------ LEITURA / TEMPO DE VISTORIA (BASE PRODUÇÃO DOS ANALISTAS) ------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def read_analistas_index(sheet_id: str, tab: str = "PRODUÇÃO") -> pd.DataFrame:
+    """Lê o índice do painel dos analistas, especialmente a aba PRODUÇÃO."""
+    sh = client.open_by_key(sheet_id)
+    ws = sh.worksheet(tab)
+    df = ws_to_df(ws)
+    if df.empty:
+        return pd.DataFrame(columns=["URL", "MÊS", "ATIVO"])
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    for need in ["URL", "MÊS", "ATIVO"]:
+        if need not in df.columns:
+            df[need] = ""
+    return df
+
+@st.cache_data(ttl=300, show_spinner=False)
+def read_tempo_vistoria_month(sheet_id: str, ym: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
+    """
+    Lê a base de PRODUÇÃO dos analistas e retorna os tempos da etapa VISTORIADOR.
+    Campos esperados, com nomes flexíveis: OS, DATA/HORA ou DATA ABERTURA MESA, TIPO USUÁRIO, USUÁRIO, TEMPO TOTAL.
+    """
+    sh = client.open_by_key(sheet_id)
+    title = sh.title or sheet_id
+    ws = sh.sheet1
+    df = ws_to_df(ws)
+
+    if df.empty:
+        return pd.DataFrame(), title
+
+    rename = {}
+    for c in df.columns:
+        cu = _strip_accents(c).upper()
+        cu_compact = cu.replace(" ", "").replace("/", "")
+
+        if "ORDEM" in cu and "SERVICO" in cu:
+            rename[c] = "OS"
+        elif cu == "OS":
+            rename[c] = "OS"
+        elif cu == "PLACA":
+            rename[c] = "PLACA"
+        elif "DATAHORA" in cu_compact or "DATAHORAV6" in cu_compact:
+            rename[c] = "DATA_HORA_V6"
+        elif "DATA ABERTURA" in cu and "MESA" in cu:
+            rename[c] = "DATA_ABERTURA_MESA"
+        elif "HORA ABERTURA" in cu and "MESA" in cu:
+            rename[c] = "HORA_ABERTURA_MESA"
+        elif "TIPO" in cu and "USUARIO" in cu:
+            rename[c] = "TIPO_USUARIO"
+        elif cu == "USUARIO" or "USUARIO" in cu:
+            rename[c] = "USUARIO"
+        elif "TEMPO" in cu and "TOTAL" in cu:
+            rename[c] = "TEMPO_TOTAL"
+
+    df = df.rename(columns=rename)
+
+    for need in ["OS", "PLACA", "DATA_HORA_V6", "DATA_ABERTURA_MESA", "TIPO_USUARIO", "USUARIO", "TEMPO_TOTAL"]:
+        if need not in df.columns:
+            df[need] = ""
+
+    if df["DATA_ABERTURA_MESA"].astype(str).str.strip().ne("").any():
+        df["DATA_BASE"] = df["DATA_ABERTURA_MESA"].apply(parse_date_any)
+    else:
+        df["DATA_BASE"] = df["DATA_HORA_V6"].apply(parse_date_any)
+
+    df["OS"] = df["OS"].astype(str).str.strip()
+    df["PLACA"] = df["PLACA"].astype(str).str.strip()
+    df["TIPO_USUARIO"] = df["TIPO_USUARIO"].astype(str).map(_upper)
+    df["USUARIO"] = df["USUARIO"].astype(str).map(_upper)
+    df["TEMPO_SEG"] = df["TEMPO_TOTAL"].apply(parse_time_seconds)
+    df["YM"] = ym or ""
+
+    # Para a nova visão, só precisamos da etapa do vistoriador e de tempos válidos.
+    df = df[
+        (df["TIPO_USUARIO"] == "VISTORIADOR") &
+        (df["USUARIO"].astype(str).str.strip() != "") &
+        (df["TEMPO_SEG"] > 0)
+    ].copy()
+
+    df = df.rename(columns={"USUARIO": "VISTORIADOR"})
+
+    return df, title
+
+
+def _empty_tempo_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["OS", "PLACA", "DATA_BASE", "TIPO_USUARIO", "VISTORIADOR", "TEMPO_TOTAL", "TEMPO_SEG", "YM"])
+
+
 # ------------------ CARREGA MESES ------------------
 idx_p = read_index(PROD_INDEX_ID)
 idx_p = idx_p[idx_p["ATIVO"].map(_yes)].copy()
@@ -317,6 +513,39 @@ dfP = pd.concat(dp_all, ignore_index=True)
 dfMetas = pd.concat(metas_all, ignore_index=True) if metas_all else pd.DataFrame(
     columns=["VISTORIADOR", "UNIDADE", "META_MENSAL", "TIPO", "DIAS_UTEIS", "YM"]
 )
+
+# ------------------ CARREGA TEMPO DE VISTORIA (BASE DO PAINEL DOS ANALISTAS) ------------------
+tempo_all = []
+tempo_errors = []
+
+if ANALISTAS_INDEX_ID:
+    try:
+        idx_tempo = read_analistas_index(ANALISTAS_INDEX_ID, tab="PRODUÇÃO")
+        idx_tempo = idx_tempo[idx_tempo["ATIVO"].map(_yes)].copy()
+        idx_tempo["YM"] = idx_tempo["MÊS"].map(_ym_token)
+        idx_tempo = idx_tempo[idx_tempo["YM"].notna()].copy()
+
+        with st.spinner(f"Lendo tempo de vistoria em {len(idx_tempo)} planilha(s) do painel dos analistas..."):
+            for _, r in idx_tempo.iterrows():
+                sid = _sheet_id(r["URL"])
+                ym = r["YM"]
+                if not sid:
+                    continue
+                try:
+                    dt, _ = read_tempo_vistoria_month(sid, ym=ym)
+                    if not dt.empty:
+                        tempo_all.append(dt)
+                except Exception as e:
+                    tempo_errors.append((sid, str(e)))
+    except Exception as e:
+        tempo_errors.append(("ÍNDICE ANALISTAS", str(e)))
+
+dfTempoVist = pd.concat(tempo_all, ignore_index=True) if tempo_all else _empty_tempo_df()
+
+if tempo_errors:
+    with st.expander("Algumas leituras de tempo de vistoria falharam (clique para ver)"):
+        for sid, msg in tempo_errors[:50]:
+            st.write(f"- {sid}: {msg}")
 
 ym_all = sorted(dfP["YM"].dropna().unique().tolist())
 label_map = {_fmt_mes(m): m for m in ym_all}
@@ -459,11 +688,37 @@ st.markdown(
 )
 
 
-# ------------------ RESUMO (mês selecionado) — MODELO ANTIGO (tendência no BRUTO) ------------------
+# ------------------ RESUMO (mês selecionado) — tendência no BRUTO ------------------
 st.markdown('<div class="section">Resumo por Vistoriador</div>', unsafe_allow_html=True)
 
 view = viewP_mes.copy()
 col_unid = "UNIDADE"
+
+# Recorte da base de tempo usando o mesmo mês, período e filtro de vistoriador.
+tempo_view = dfTempoVist[dfTempoVist["YM"].astype(str) == ym_sel].copy() if not dfTempoVist.empty else _empty_tempo_df()
+if not tempo_view.empty and isinstance(start_d, date) and isinstance(end_d, date):
+    tempo_view = tempo_view[
+        (tempo_view["DATA_BASE"] >= start_d) &
+        (tempo_view["DATA_BASE"] <= end_d)
+    ].copy()
+if not tempo_view.empty:
+    sel_v_tempo = st.session_state.get("f_vists", [])
+    if sel_v_tempo:
+        tempo_view = tempo_view[tempo_view["VISTORIADOR"].isin([_upper(v) for v in sel_v_tempo])].copy()
+
+if not tempo_view.empty:
+    tempo_por_vist = (
+        tempo_view.groupby("VISTORIADOR", dropna=False)
+        .agg(
+            OS_TEMPO=("OS", "nunique"),
+            REGISTROS_TEMPO=("TEMPO_SEG", "size"),
+            TEMPO_MEDIO_SEG=("TEMPO_SEG", "mean"),
+            TEMPO_TOTAL_SEG=("TEMPO_SEG", "sum"),
+        )
+        .reset_index()
+    )
+else:
+    tempo_por_vist = pd.DataFrame(columns=["VISTORIADOR", "OS_TEMPO", "REGISTROS_TEMPO", "TEMPO_MEDIO_SEG", "TEMPO_TOTAL_SEG"])
 
 if view.empty:
     st.caption("Sem registros para os filtros aplicados.")
@@ -480,24 +735,25 @@ else:
 
     grp["LIQUIDO"] = grp["VISTORIAS"] - grp["REVISTORIAS"]
 
-    def _calc_wd_passados(df_view: pd.DataFrame) -> pd.DataFrame:
-        if df_view.empty or "__DATA__" not in df_view.columns or "VISTORIADOR" not in df_view.columns:
-            return pd.DataFrame(columns=["VISTORIADOR", "DIAS_PASSADOS"])
-        mask = df_view["__DATA__"].apply(_is_workday)
-        if not mask.any():
-            vists = df_view["VISTORIADOR"].dropna().unique()
-            return pd.DataFrame({"VISTORIADOR": vists, "DIAS_PASSADOS": np.zeros(len(vists), dtype=int)})
-        out = (df_view.loc[mask]
-               .groupby("VISTORIADOR")["__DATA__"]
-               .nunique()
-               .reset_index()
-               .rename(columns={"__DATA__": "DIAS_PASSADOS"}))
-        out["DIAS_PASSADOS"] = out["DIAS_PASSADOS"].astype(int)
-        return out
+    # Anexa tempo médio vindo da base de PRODUÇÃO dos analistas, etapa VISTORIADOR.
+    if not tempo_por_vist.empty:
+        grp = grp.merge(tempo_por_vist, on="VISTORIADOR", how="left")
+    else:
+        grp["OS_TEMPO"] = 0
+        grp["REGISTROS_TEMPO"] = 0
+        grp["TEMPO_MEDIO_SEG"] = np.nan
+        grp["TEMPO_TOTAL_SEG"] = np.nan
 
-    wd_passados = _calc_wd_passados(view)
-    grp = grp.merge(wd_passados, on="VISTORIADOR", how="left").fillna({"DIAS_PASSADOS": 0})
-    grp["DIAS_PASSADOS"] = grp["DIAS_PASSADOS"].astype(int)
+    for c in ["OS_TEMPO", "REGISTROS_TEMPO"]:
+        grp[c] = pd.to_numeric(grp.get(c, 0), errors="coerce").fillna(0).astype(int)
+    for c in ["TEMPO_MEDIO_SEG", "TEMPO_TOTAL_SEG"]:
+        grp[c] = pd.to_numeric(grp.get(c, np.nan), errors="coerce")
+
+    # >>> CORREÇÃO: DIAS_PASSADOS por CALENDÁRIO (dias úteis decorridos até a data de referência)
+    datas_ok = [d for d in view["__DATA__"] if isinstance(d, date)]
+    ref_date = end_d if isinstance(end_d, date) else (max(datas_ok) if datas_ok else None)
+    dias_passados_cal = _workdays_elapsed_in_month(ref_date) if ref_date else 0
+    grp["DIAS_PASSADOS"] = int(dias_passados_cal)
 
     metas_ref = dfMetas[dfMetas["YM"].astype(str) == ym_sel].copy() if not dfMetas.empty else pd.DataFrame()
 
@@ -525,7 +781,9 @@ else:
     grp["DIAS_UTEIS"] = pd.to_numeric(grp.get("DIAS_UTEIS", 0), errors="coerce").fillna(0).astype(int)
 
     grp["META_DIA"] = np.where(grp["DIAS_UTEIS"] > 0, grp["META_MENSAL"] / grp["DIAS_UTEIS"], 0.0)
-    grp["FALTANTE_MES"] = np.maximum(grp["META_MENSAL"] - grp["LIQUIDO"], 0)
+
+    # >>> CORREÇÃO: FALTANTE_MES coerente com tendência/projeção no BRUTO (VISTORIAS)
+    grp["FALTANTE_MES"] = np.maximum(grp["META_MENSAL"] - grp["VISTORIAS"], 0)
 
     grp["DIAS_RESTANTES"] = np.maximum(grp["DIAS_UTEIS"] - grp["DIAS_PASSADOS"], 0)
 
@@ -587,11 +845,15 @@ else:
     fmt["NECESSIDADE_DIA"]  = fmt["NECESSIDADE_DIA"].apply(chip_nec)
     fmt["TENDÊNCIA"]        = fmt["TENDENCIA_%"].apply(chip_tend)
     fmt["PROJECAO_MES"]     = fmt["PROJECAO_MES"].map(lambda x: "—" if pd.isna(x) else f"{int(round(x))}")
+    fmt["OS_TEMPO"]         = fmt["OS_TEMPO"].map(lambda x: "—" if pd.isna(x) or int(x) <= 0 else f"{int(x)}")
+    fmt["TEMPO_MEDIO"]      = fmt["TEMPO_MEDIO_SEG"].apply(format_seconds_mmss)
+    fmt["TEMPO_TOTAL"]      = fmt["TEMPO_TOTAL_SEG"].apply(format_seconds_mmss)
 
     cols_show = [
         "VISTORIADOR", "UNIDADE", "TIPO",
         "META_MENSAL", "DIAS_UTEIS", "META_DIA",
         "VISTORIAS", "REVISTORIAS", "LIQUIDO",
+        "OS_TEMPO", "TEMPO_MEDIO", "TEMPO_TOTAL",
         "FALTANTE_MES", "NECESSIDADE_DIA", "TENDÊNCIA", "PROJECAO_MES"
     ]
     cols_show_avail = [c for c in cols_show if c in fmt.columns]
@@ -602,6 +864,70 @@ else:
         st.dataframe(fmt[cols_show_avail], use_container_width=True, hide_index=True)
         csv = fmt[cols_show_avail].to_csv(index=False).encode("utf-8-sig")
         st.download_button("Baixar resumo (CSV)", data=csv, file_name="resumo_vistoriador.csv", mime="text/csv")
+
+
+# ------------------ TEMPO MÉDIO DE VISTORIA POR VISTORIADOR ------------------
+st.markdown("---")
+st.markdown('<div class="section">Tempo médio de vistoria por vistoriador</div>', unsafe_allow_html=True)
+
+if dfTempoVist.empty:
+    st.info("Não encontrei dados de tempo de vistoria. Verifique se `analistas_index_sheet_id` está configurado no secrets e se a aba PRODUÇÃO do índice está ativa.")
+elif tempo_view.empty:
+    st.caption("Sem registros de tempo de vistoria para o mês/período/vistoriador selecionado.")
+else:
+    tempo_tbl = tempo_por_vist.copy()
+    tempo_tbl = tempo_tbl[tempo_tbl["OS_TEMPO"] > 0].copy()
+
+    if tempo_tbl.empty:
+        st.caption("Sem registros válidos de tempo para exibir.")
+    else:
+        tempo_medio_geral = tempo_view["TEMPO_SEG"].mean()
+        os_total_tempo = int(tempo_view["OS"].nunique())
+        maior = tempo_tbl.sort_values("TEMPO_MEDIO_SEG", ascending=False).iloc[0]
+        menor = tempo_tbl.sort_values("TEMPO_MEDIO_SEG", ascending=True).iloc[0]
+
+        st.markdown(
+            f"""
+<div class="card-wrap">
+  <div class='card'><h4>Tempo médio geral</h4><h2>{format_seconds_mmss(tempo_medio_geral)}</h2><span class='sub neu'>etapa vistoriador</span></div>
+  <div class='card'><h4>OS consideradas</h4><h2>{_fmt_int(os_total_tempo)}</h2><span class='sub neu'>base dos analistas</span></div>
+  <div class='card'><h4>Maior tempo médio</h4><h2>{format_seconds_mmss(maior['TEMPO_MEDIO_SEG'])}</h2><span class='sub bad'>{maior['VISTORIADOR']}</span></div>
+  <div class='card'><h4>Menor tempo médio</h4><h2>{format_seconds_mmss(menor['TEMPO_MEDIO_SEG'])}</h2><span class='sub ok'>{menor['VISTORIADOR']}</span></div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+        tempo_chart = tempo_tbl.sort_values("TEMPO_MEDIO_SEG", ascending=False).copy()
+        tempo_chart["TEMPO_MEDIO"] = tempo_chart["TEMPO_MEDIO_SEG"].apply(format_seconds_mmss)
+
+        base_chart = alt.Chart(tempo_chart).encode(
+            x=alt.X("VISTORIADOR:N", sort="-y", title="Vistoriador", axis=alt.Axis(labelAngle=-30, labelLimit=180)),
+            y=alt.Y("TEMPO_MEDIO_SEG:Q", title="Tempo médio em segundos"),
+            tooltip=[
+                alt.Tooltip("VISTORIADOR:N", title="Vistoriador"),
+                alt.Tooltip("OS_TEMPO:Q", title="OS consideradas", format=".0f"),
+                alt.Tooltip("TEMPO_MEDIO:N", title="Tempo médio"),
+                alt.Tooltip("TEMPO_MEDIO_SEG:Q", title="Segundos", format=".1f"),
+            ],
+        )
+        bars = base_chart.mark_bar()
+        labels = base_chart.mark_text(dy=-6).encode(text="TEMPO_MEDIO:N")
+        st.altair_chart((bars + labels).properties(height=380), use_container_width=True)
+
+        tempo_export = tempo_tbl.sort_values("TEMPO_MEDIO_SEG", ascending=False).copy()
+        tempo_export["TEMPO_MEDIO"] = tempo_export["TEMPO_MEDIO_SEG"].apply(format_seconds_mmss)
+        tempo_export["TEMPO_TOTAL"] = tempo_export["TEMPO_TOTAL_SEG"].apply(format_seconds_mmss)
+        tempo_export = tempo_export[["VISTORIADOR", "OS_TEMPO", "REGISTROS_TEMPO", "TEMPO_MEDIO", "TEMPO_TOTAL"]].rename(columns={
+            "OS_TEMPO": "OS consideradas",
+            "REGISTROS_TEMPO": "Registros de tempo",
+            "TEMPO_MEDIO": "Tempo médio",
+            "TEMPO_TOTAL": "Tempo total",
+        })
+        st.dataframe(tempo_export, use_container_width=True, hide_index=True)
+
+        csv_tempo = tempo_export.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("Baixar tempo médio (CSV)", data=csv_tempo, file_name="tempo_medio_vistoriador.csv", mime="text/csv")
 
 
 # ------------------ HISTÓRICO VISUAL (MODELO QUALIDADE) ------------------
