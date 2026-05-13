@@ -130,14 +130,30 @@ def _ym_token(x: str) -> Optional[str]:
 def parse_date_any(x):
     if pd.isna(x) or x == "":
         return pd.NaT
+
+    # Excel serial date
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        try:
+            return (pd.to_datetime("1899-12-30") + pd.to_timedelta(int(x), unit="D")).date()
+        except Exception:
+            pass
+
     s = str(x).strip()
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             return datetime.strptime(s, fmt).date()
         except Exception:
             pass
+
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+
     try:
-        return pd.to_datetime(s).date()
+        return pd.to_datetime(s, dayfirst=True).date()
     except Exception:
         return pd.NaT
 
@@ -440,10 +456,13 @@ def read_tempo_vistoria_month(sheet_id: str, ym: Optional[str] = None) -> Tuple[
         if need not in df.columns:
             df[need] = ""
 
-    if df["DATA_ABERTURA_MESA"].astype(str).str.strip().ne("").any():
-        df["DATA_BASE"] = df["DATA_ABERTURA_MESA"].apply(parse_date_any)
-    else:
-        df["DATA_BASE"] = df["DATA_HORA_V6"].apply(parse_date_any)
+    # Fallback linha a linha, igual ao painel da Mesa LOG:
+    # 1) tenta DATA_ABERTURA_MESA; 2) se vier vazia/inválida, usa DATA_HORA_V6.
+    data_abertura = df["DATA_ABERTURA_MESA"].apply(parse_date_any)
+    data_v6 = df["DATA_HORA_V6"].apply(parse_date_any)
+    df["DATA_BASE"] = data_abertura
+    mask_faltante = pd.isna(df["DATA_BASE"])
+    df.loc[mask_faltante, "DATA_BASE"] = data_v6[mask_faltante]
 
     df["OS"] = df["OS"].astype(str).str.strip()
     df["PLACA"] = df["PLACA"].astype(str).str.strip()
